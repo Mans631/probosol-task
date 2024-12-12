@@ -1,9 +1,8 @@
 import streamlit as st
 import mysql.connector
 import os
-from PyPDF2 import PdfReader
-from PIL import Image
-import pytesseract
+from PyPDF2 import PdfReader, PdfWriter
+import hashlib
 import re
 
 # MySQL connection settings
@@ -16,6 +15,8 @@ MYSQL_DATABASE = "employee_page"  # Replace with your database name
 DOCUMENT_UPLOAD_FOLDER = "uploaded_documents"
 os.makedirs(DOCUMENT_UPLOAD_FOLDER, exist_ok=True)
 
+MAX_UPLOAD_SIZE_MB = 5  # Maximum upload size in MB
+
 # Establish a connection to MySQL
 def connect_to_mysql():
     return mysql.connector.connect(
@@ -25,7 +26,160 @@ def connect_to_mysql():
         database=MYSQL_DATABASE
     )
 
-# Function to load employee data from MySQL
+# Function to load document hashes from MySQL
+def load_invoice_hashes():
+    connection = connect_to_mysql()
+    cursor = connection.cursor()
+    cursor.execute("SELECT invoice_hash FROM invoices")
+    hashes = {row[0] for row in cursor.fetchall()}
+    connection.close()
+    return hashes
+
+# Function to calculate hash of a given content
+def calculate_hash(content):
+    return hashlib.sha256(content.encode()).hexdigest()
+
+# Function to repair a corrupted PDF
+def repair_pdf(file_path):
+    """Attempts to repair a corrupted PDF file."""
+    try:
+        with open(file_path, "rb") as infile:
+            reader = PdfReader(infile)
+            repaired_pdf_path = file_path.replace(".pdf", "_repaired.pdf")
+            with open(repaired_pdf_path, "wb") as outfile:
+                writer = PdfWriter()
+                for page in reader.pages:
+                    writer.add_page(page)
+                writer.write(outfile)
+            return repaired_pdf_path
+    except Exception as e:
+        return None
+
+# Function to extract text from a PDF
+def extract_text_from_pdf(file_path):
+    """Extracts text from a PDF, skipping corrupted pages if any."""
+    try:
+        content = []
+        with open(file_path, "rb") as f:
+            reader = PdfReader(f)
+            for i, page in enumerate(reader.pages):
+                try:
+                    content.append(page.extract_text())
+                except Exception as e:
+                    st.warning(f"Could not read page {i + 1}: {str(e)}")
+        return " ".join(content)
+    except Exception as e:
+        return None
+
+# Function to extract individual invoices from a PDF
+def extract_invoices_from_pdf(file_path):
+    # Repair the PDF first if needed
+    repaired_pdf_path = repair_pdf(file_path)
+    pdf_path_to_read = repaired_pdf_path if repaired_pdf_path else file_path
+
+    # Extract text, skipping corrupted pages
+    content = extract_text_from_pdf(pdf_path_to_read)
+    if not content:
+        return []
+
+    # Split invoices by a keyword, e.g., "Invoice No:"
+    invoices = re.split(r"(Invoice No:\s*\d+)", content, flags=re.IGNORECASE)
+    combined_invoices = []
+
+    for i in range(1, len(invoices), 2):
+        invoice_header = invoices[i]
+        invoice_body = invoices[i + 1] if i + 1 < len(invoices) else ""
+        combined_invoices.append(invoice_header + invoice_body)
+
+    return combined_invoices
+
+def handle_file_upload(employee_id, employee_name, uploaded_files):
+    existing_hashes = load_invoice_hashes()
+
+    for uploaded_file in uploaded_files:
+        file_size_mb = len(uploaded_file.read()) / (1024 * 1024)
+        uploaded_file.seek(0)  # Reset file pointer
+
+        if file_size_mb > MAX_UPLOAD_SIZE_MB:
+            st.error(f"File {uploaded_file.name} exceeds the size limit of {MAX_UPLOAD_SIZE_MB} MB.")
+            continue
+
+        # Save file temporarily for processing
+        file_name = f"{employee_id}_{uploaded_file.name}"
+        file_path = os.path.join(DOCUMENT_UPLOAD_FOLDER, file_name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.read())
+
+        # Extract invoices and calculate hashes
+        invoices = extract_invoices_from_pdf(file_path)
+        if len(invoices) > 6:
+            st.warning(f"File {uploaded_file.name} contains more than 6 invoices. Processing...")
+        duplicate_count = 0
+        new_count = 0
+
+        for invoice in invoices:
+            invoice_hash = calculate_hash(invoice)
+
+            # Check if hash already exists and by whom
+            connection = connect_to_mysql()
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute(
+                """
+                SELECT employee_id, employee_name 
+                FROM invoices 
+                WHERE invoice_hash = %s
+                """,
+                (invoice_hash,),
+            )
+            result = cursor.fetchone()
+            connection.close()
+
+            if result:  # Invoice hash found
+                if str(result["employee_id"]) == str(employee_id):
+                    st.warning(f"Duplicate Invoice Detected for Employee ID {employee_id}: {invoice[:50]}...")
+                else:
+                    st.error(
+                        f"Invoice already uploaded by another employee "
+                        f"({result['employee_name']} - Employee ID: {result['employee_id']}): {invoice[:50]}..."
+                    )
+                duplicate_count += 1
+            else:  # New invoice, save to database
+                connection = connect_to_mysql()
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO invoices (employee_id, employee_name, invoice_hash) 
+                    VALUES (%s, %s, %s)
+                    """,
+                    (employee_id, employee_name, invoice_hash),
+                )
+                connection.commit()
+                connection.close()
+
+                st.success(f"New Invoice Processed: {invoice[:50]}...")
+                new_count += 1
+
+        st.info(f"Processed {len(invoices)} invoices: {new_count} new, {duplicate_count} duplicates.")
+# Add document functionality
+def add_document(employee_data):
+    st.subheader("Add Document for Employee")
+    with st.form("add_document_form"):
+        selected_employee = st.selectbox(
+            "Select Employee",
+            employee_data,
+            format_func=lambda emp: f"{emp['name']} (ID: {emp['id']})",
+        )
+        uploaded_files = st.file_uploader("Upload Documents", accept_multiple_files=True, type=["pdf","jpg"])
+        submit_documents = st.form_submit_button("Upload Documents")
+        if submit_documents:
+            if selected_employee and uploaded_files:
+                employee_id = selected_employee["id"]
+                employee_name = selected_employee["name"]
+                handle_file_upload(employee_id, employee_name, uploaded_files)
+            else:
+                st.error("Please select an employee and upload at least one document.")
+
+# Load employee data from MySQL
 def load_employee_data():
     connection = connect_to_mysql()
     cursor = connection.cursor(dictionary=True)
@@ -33,67 +187,6 @@ def load_employee_data():
     employees = cursor.fetchall()
     connection.close()
     return employees
-
-# Function to load all existing IDs from MySQL
-def load_existing_ids():
-    connection = connect_to_mysql()
-    cursor = connection.cursor()
-    cursor.execute("SELECT id FROM employees")
-    ids = [row[0] for row in cursor.fetchall()]
-    connection.close()
-    return ids
-
-# Function to save unmatched document ID to MySQL
-def save_unmatched_id_to_mysql(document_id):
-    connection = connect_to_mysql()
-    cursor = connection.cursor()
-    cursor.execute(
-        "INSERT INTO unmatched_ids (document_id) VALUES (%s)", (document_id,)
-    )
-    connection.commit()
-    connection.close()
-
-# Function to extract ID from document content
-def extract_id_from_content(content):
-    match = re.search(r"ID:\s*(\d+)", content)
-    return match.group(1) if match else None
-
-# Function to read content of the uploaded documents
-def read_document_content(file_path, file_name):
-    try:
-        if file_name.endswith(".pdf"):
-            reader = PdfReader(file_path)
-            return " ".join(page.extract_text() for page in reader.pages)
-        elif file_name.lower().endswith((".jpg", ".png")):
-            image = Image.open(file_path)
-            return pytesseract.image_to_string(image)
-        elif file_name.endswith(".txt"):
-            with open(file_path, "r") as f:
-                return f.read()
-        else:
-            return "Unsupported file format."
-    except Exception as e:
-        return f"Error reading content: {str(e)}"
-
-# Function to handle file uploads
-def handle_file_upload(employee_id, uploaded_files):
-    existing_ids = load_existing_ids()
-
-    for uploaded_file in uploaded_files:
-        file_name = f"{employee_id}_{uploaded_file.name}"
-        file_path = os.path.join(DOCUMENT_UPLOAD_FOLDER, file_name)
-        with open(file_path, "wb") as f:
-            file_data = uploaded_file.read()
-            f.write(file_data)
-
-        content = read_document_content(file_path, uploaded_file.name)
-        st.text_area(f"Content of {uploaded_file.name}:", content, height=200)
-
-        document_id = extract_id_from_content(content)
-        if document_id:
-            if int(document_id) not in existing_ids:
-                save_unmatched_id_to_mysql(document_id)
-                st.warning(f"Unmatched Document ID found: {document_id}. Saved to database.")
 
 # Add new employee functionality
 def add_new_employee():
@@ -118,20 +211,6 @@ def add_new_employee():
             else:
                 st.error("Please fill in all required fields.")
 
-# Add document functionality
-def add_document(employee_data):
-    st.subheader("Add Document for Employee")
-    with st.form("add_document_form"):
-        employee_id = st.selectbox("Select Employee ID", [emp["id"] for emp in employee_data], format_func=lambda x: f"ID: {x}")
-        uploaded_files = st.file_uploader("Upload Documents", accept_multiple_files=True)
-        submit_documents = st.form_submit_button("Upload Documents")
-        if submit_documents:
-            if employee_id and uploaded_files:
-                handle_file_upload(employee_id, uploaded_files)
-                st.success(f"Uploaded {len(uploaded_files)} document(s) for Employee ID {employee_id}.")
-            else:
-                st.error("Please select an employee and upload at least one document.")
-
 # Dashboard interface
 def dashboard():
     st.title("Employee Dashboard")
@@ -151,9 +230,9 @@ def dashboard():
         if employee_data:
             for emp in employee_data:
                 st.write(f"### Employee: {emp['name']}")
-                st.write(f"*Email:* {emp['email']}")
-                st.write(f"*Phone:* {emp['phone']}")
-                st.write(f"*Employee ID:* {emp['id']}")
+                st.write(f"Email: {emp['email']}")
+                st.write(f"Phone: {emp['phone']}")
+                st.write(f"Employee ID: {emp['id']}")
         else:
             st.write("No employees found.")
     elif menu == "Add New Employee":
